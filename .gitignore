@@ -8,8 +8,13 @@ captures/
 .externalNativeBuild/
 .cxx/
 *.aab
-*.apk
 output-metadata.json
+# ignore apks everywhere
+*.apk
+
+# but allow checked-in apks in release/
+!release/*.apk
+
 
 *.log
 

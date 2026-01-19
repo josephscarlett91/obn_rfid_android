@@ -36,6 +36,7 @@ android {
 }
 
 dependencies {
+  implementation(files("libs/reader.jar"))
   implementation(libs.androidx.core.ktx)
   implementation(libs.activity.compose)
 
