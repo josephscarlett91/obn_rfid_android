@@ -34,6 +34,10 @@ private const val TAG = "RFID"
 private val NUS: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
 private val FFE0: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
 
+// app policy
+private const val DEFAULT_RANGE_IDX = 4
+private const val DEFAULT_POWER = 30
+
 // Logging Return Code
 private fun Message.rt(): Int = getRtCode().toInt() and 0xFF
 private fun Message.rtStr(): String = "rtCode=${rt()} rtMsg=${getRtMsg()}"
@@ -116,12 +120,15 @@ private fun FreqRangeAdminRow(
   Column {
     Text(
       text = "FreqRangeIdx: ${currentRangeIdx ?: "—"}",
-      modifier = Modifier.clickable { egg.tap() }
+      modifier = Modifier.clickable { egg.tap() } // 7 taps
     )
 
     if (adminUnlocked) {
       Spacer(Modifier.height(8.dp))
-      Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+      Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
         OutlinedButton(onClick = { onSelect((selectedRangeIdx - 1).coerceAtLeast(0)) }) { Text("−") }
         Text("Selected: $selectedRangeIdx")
         OutlinedButton(onClick = { onSelect(selectedRangeIdx + 1) }) { Text("+") }
@@ -132,9 +139,9 @@ private fun FreqRangeAdminRow(
   }
 }
 
-// -------------------- NEW: generalized "set range idx + power" --------------------
+// -------------------- Set range idx + power --------------------
 
-private suspend fun setFrequencyRangeAndPower(rangeIdx: Int, power: Int = 30): String =
+private suspend fun setFrequencyRangeAndPower(rangeIdx: Int, power: Int = DEFAULT_POWER): String =
   withContext(Dispatchers.IO) {
     val c = Rfid.client ?: return@withContext "no client"
 
@@ -190,7 +197,12 @@ class Main : ComponentActivity() {
 
       // hidden/admin state
       var admin by remember { mutableStateOf(false) }
-      var selRangeIdx by remember { mutableStateOf(4) } // default-ish; will sync after Query
+
+      // selection starts at the mandated default; device will be forced to this on connect
+      var selRangeIdx by remember { mutableStateOf(DEFAULT_RANGE_IDX) }
+
+      // run "force default" once per connection
+      var appliedDefaultThisConn by remember { mutableStateOf(false) }
 
       fun query() = scope.launch {
         busy = true
@@ -200,13 +212,37 @@ class Main : ComponentActivity() {
         busy = false
       }
 
-      fun setRange() = scope.launch {
+      fun applyDefaultOnConnect() = scope.launch {
         busy = true
         err = null
-        val res = setFrequencyRangeAndPower(rangeIdx = selRangeIdx, power = 30)
+        val res = setFrequencyRangeAndPower(rangeIdx = DEFAULT_RANGE_IDX, power = DEFAULT_POWER)
+        fp = queryFreqPower()
+        selRangeIdx = fp?.rangeIdx ?: DEFAULT_RANGE_IDX
+        err = res
+        busy = false
+      }
+
+      fun setRangeAsAdmin() = scope.launch {
+        if (!admin) { err = "admin required"; return@launch }
+        busy = true
+        err = null
+        val res = setFrequencyRangeAndPower(rangeIdx = selRangeIdx, power = DEFAULT_POWER)
         fp = queryFreqPower()
         err = res
         busy = false
+      }
+
+      // reset once-per-connection latch on disconnect
+      LaunchedEffect(on) {
+        if (!on) appliedDefaultThisConn = false
+      }
+
+      // enforce default (idx=4) once after connect
+      LaunchedEffect(on, busy) {
+        if (on && !busy && !appliedDefaultThisConn) {
+          appliedDefaultThisConn = true
+          applyDefaultOnConnect()
+        }
       }
 
       MaterialTheme {
@@ -227,11 +263,14 @@ class Main : ComponentActivity() {
                   modifier = Modifier.widthIn(min = 240.dp).heightIn(min = 52.dp)
                 ) { Text("Query Freq + Power") }
 
-                Button(
-                  onClick = { if (!busy) setRange() },
-                  enabled = !busy,
-                  modifier = Modifier.padding(top = 12.dp).widthIn(min = 240.dp).heightIn(min = 52.dp)
-                ) { Text("Set Range + Power") }
+                // admin-only setter
+                if (admin) {
+                  Button(
+                    onClick = { if (!busy) setRangeAsAdmin() },
+                    enabled = !busy,
+                    modifier = Modifier.padding(top = 12.dp).widthIn(min = 240.dp).heightIn(min = 52.dp)
+                  ) { Text("Set Range + Power") }
+                }
 
                 Button(
                   onClick = { screen = 1 },
