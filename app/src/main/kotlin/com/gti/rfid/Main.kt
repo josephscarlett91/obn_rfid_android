@@ -6,10 +6,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -35,14 +37,6 @@ private val FFE0: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
 // Logging Return Code
 private fun Message.rt(): Int = getRtCode().toInt() and 0xFF
 private fun Message.rtStr(): String = "rtCode=${rt()} rtMsg=${getRtMsg()}"
-
-// Optional: log every command's result
-private fun <T : Message> GClient.sendDbg(m: T): T =
-m.also(::sendSynMsg).also { Log.e(TAG, "${m.javaClass.simpleName}: ${it.rtStr()}") }
-
-private const val EU_RANGE_IDX = 4
-private const val ANT1 = 1
-
 private fun ok(msg: Message) = (msg.getRtCode().toInt() and 0xFF) == 0
 private fun u8(x: Any?) = when (x) {
   is Byte -> x.toInt() and 0xFF
@@ -53,6 +47,12 @@ private fun u8(x: Any?) = when (x) {
   else -> 0
 }
 
+// Optional: log every command's result
+private fun <T : Message> GClient.sendDbg(m: T): T =
+  m.also(::sendSynMsg).also { Log.e(TAG, "${m.javaClass.simpleName}: ${it.rtStr()}") }
+
+private const val ANT1 = 1
+
 data class FreqPower(
   val rangeIdx: Int,
   val freqs: List<String>,
@@ -60,15 +60,15 @@ data class FreqPower(
 )
 
 private fun getFreqRangeIndex(c: GClient): Int? =
-MsgBaseGetFreqRange().also(c::sendSynMsg).let { if (ok(it)) u8(it.getFreqRangeIndex()) else null }
+  MsgBaseGetFreqRange().also(c::sendSynMsg).let { if (ok(it)) u8(it.getFreqRangeIndex()) else null }
 
 private fun getFrequency(c: GClient): MsgBaseGetFrequency? =
-MsgBaseGetFrequency().also(c::sendSynMsg).let { if (ok(it)) it else null }
+  MsgBaseGetFrequency().also(c::sendSynMsg).let { if (ok(it)) it else null }
 
 private fun getPowerAnt1(c: GClient): Int? =
-MsgBaseGetPower().also(c::sendSynMsg).let { m ->
-  if (!ok(m)) null else m.getDicPower()?.get(ANT1)?.let(::u8)
-}
+  MsgBaseGetPower().also(c::sendSynMsg).let { m ->
+    if (!ok(m)) null else m.getDicPower()?.get(ANT1)?.let(::u8)
+  }
 
 private suspend fun queryFreqPower(): FreqPower? = withContext(Dispatchers.IO) {
   val c = Rfid.client ?: return@withContext null
@@ -84,27 +84,80 @@ private suspend fun queryFreqPower(): FreqPower? = withContext(Dispatchers.IO) {
   FreqPower(rangeIdx = rangeIdx, freqs = picked, powerAnt1 = p.coerceIn(0, 33))
 }
 
-private suspend fun setEuFrequencyAndPower(power: Int = 30): String = withContext(Dispatchers.IO) {
-  val c = Rfid.client ?: return@withContext "no client"
+// -------------------- Hidden tap-sequence unlock + range selection --------------------
 
-  c.sendDbg(MsgBaseStop())
+private class TapEasterEgg(
+  private val taps: Int = 7,
+  private val windowMs: Long = 1200L,
+  private val onTriggered: () -> Unit,
+) {
+  private var count = 0
+  private var start = 0L
 
-  c.sendDbg(MsgBaseSetFreqRange().apply { setFreqRangeIndex(EU_RANGE_IDX) })
-  .also { if (!ok(it)) return@withContext "SetFreqRange failed: ${it.rtStr()}" }
+  fun tap() {
+    val now = SystemClock.elapsedRealtime()
+    if (count == 0) start = now
+    if (now - start > windowMs) { count = 0; start = now }
+    if (++count >= taps) { count = 0; start = 0L; onTriggered() }
+  }
+}
 
-  c.sendDbg(MsgBaseGetFreqRange())
-  .also { if (!ok(it)) return@withContext "GetFreqRange failed: ${it.rtStr()}" }
-  .also {
-    val got = u8(it.getFreqRangeIndex())
-    if (got != EU_RANGE_IDX) return@withContext "FreqRange verify failed: want=$EU_RANGE_IDX got=$got"
+@Composable
+private fun FreqRangeAdminRow(
+  currentRangeIdx: Int?,
+  selectedRangeIdx: Int,
+  onSelect: (Int) -> Unit,
+  adminUnlocked: Boolean,
+  onUnlock: () -> Unit,
+  onRelock: () -> Unit,
+) {
+  val egg = remember { TapEasterEgg(taps = 7, windowMs = 1200L, onTriggered = onUnlock) }
+
+  Column {
+    Text(
+      text = "FreqRangeIdx: ${currentRangeIdx ?: "—"}",
+      modifier = Modifier.clickable { egg.tap() }
+    )
+
+    if (adminUnlocked) {
+      Spacer(Modifier.height(8.dp))
+      Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        OutlinedButton(onClick = { onSelect((selectedRangeIdx - 1).coerceAtLeast(0)) }) { Text("−") }
+        Text("Selected: $selectedRangeIdx")
+        OutlinedButton(onClick = { onSelect(selectedRangeIdx + 1) }) { Text("+") }
+        Spacer(Modifier.width(12.dp))
+        TextButton(onClick = onRelock) { Text("Hide") }
+      }
+    }
+  }
+}
+
+// -------------------- NEW: generalized "set range idx + power" --------------------
+
+private suspend fun setFrequencyRangeAndPower(rangeIdx: Int, power: Int = 30): String =
+  withContext(Dispatchers.IO) {
+    val c = Rfid.client ?: return@withContext "no client"
+
+    c.sendDbg(MsgBaseStop())
+
+    c.sendDbg(MsgBaseSetFreqRange().apply { setFreqRangeIndex(rangeIdx) })
+      .also { if (!ok(it)) return@withContext "SetFreqRange failed: ${it.rtStr()}" }
+
+    c.sendDbg(MsgBaseGetFreqRange())
+      .also { if (!ok(it)) return@withContext "GetFreqRange failed: ${it.rtStr()}" }
+      .also {
+        val got = u8(it.getFreqRangeIndex())
+        if (got != rangeIdx) return@withContext "FreqRange verify failed: want=$rangeIdx got=$got"
+      }
+
+    val map = Hashtable<Int, Int>().apply { put(ANT1, power.coerceIn(0, 33)) }
+    c.sendDbg(MsgBaseSetPower().apply { setDicPower(map) })
+      .also { if (!ok(it)) return@withContext "SetPower failed: ${it.rtStr()}" }
+
+    "rangeIdx=$rangeIdx power=${power.coerceIn(0, 33)} ok"
   }
 
-  val map = Hashtable<Int, Int>().apply { put(ANT1, power.coerceIn(0, 33)) }
-  c.sendDbg(MsgBaseSetPower().apply { setDicPower(map) })
-  .also { if (!ok(it)) return@withContext "SetPower failed: ${it.rtStr()}" }
-
-  "EU range + power ok (rangeIdx=$EU_RANGE_IDX power=$power)"
-}
+// -------------------- Activity --------------------
 
 class Main : ComponentActivity() {
   private var c: BluetoothCentralManager? = null
@@ -120,31 +173,37 @@ class Main : ComponentActivity() {
     ActivityResultContracts.RequestMultiplePermissions()
   ) { r ->
     (cont.also { cont = null } ?: return@registerForActivityResult)
-    .let { if (r.values.all { it }) it() else { busy = false; err = "permission denied" } }
+      .let { if (r.values.all { it }) it() else { busy = false; err = "permission denied" } }
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
     runCatching { if (Rfid.client == null) Rfid.client = GClient() }
-    .onFailure { Log.e(TAG, "GClient", it); err = "GClient failed" }
+      .onFailure { Log.e(TAG, "GClient", it); err = "GClient failed" }
 
     setContent {
-      var screen by remember { mutableStateOf(0) } 
+      var screen by remember { mutableStateOf(0) }
       val scope = rememberCoroutineScope()
+
       var fp by remember { mutableStateOf<FreqPower?>(null) }
+
+      // hidden/admin state
+      var admin by remember { mutableStateOf(false) }
+      var selRangeIdx by remember { mutableStateOf(4) } // default-ish; will sync after Query
 
       fun query() = scope.launch {
         busy = true
         err = null
         fp = queryFreqPower().also { if (it == null) err = "query failed (see logcat)" }
+        fp?.rangeIdx?.let { selRangeIdx = it }
         busy = false
       }
 
-      fun setEU() = scope.launch {
+      fun setRange() = scope.launch {
         busy = true
         err = null
-        val res = setEuFrequencyAndPower(power = 30)
+        val res = setFrequencyRangeAndPower(rangeIdx = selRangeIdx, power = 30)
         fp = queryFreqPower()
         err = res
         busy = false
@@ -169,10 +228,10 @@ class Main : ComponentActivity() {
                 ) { Text("Query Freq + Power") }
 
                 Button(
-                  onClick = { if (!busy) setEU() },
+                  onClick = { if (!busy) setRange() },
                   enabled = !busy,
                   modifier = Modifier.padding(top = 12.dp).widthIn(min = 240.dp).heightIn(min = 52.dp)
-                ) { Text("Set EU + Power") }
+                ) { Text("Set Range + Power") }
 
                 Button(
                   onClick = { screen = 1 },
@@ -188,7 +247,16 @@ class Main : ComponentActivity() {
 
               fp?.let {
                 Spacer(Modifier.height(12.dp))
-                Text("FreqRangeIdx: ${it.rangeIdx}")
+
+                FreqRangeAdminRow(
+                  currentRangeIdx = it.rangeIdx,
+                  selectedRangeIdx = selRangeIdx,
+                  onSelect = { selRangeIdx = it },
+                  adminUnlocked = admin,
+                  onUnlock = { admin = true },
+                  onRelock = { admin = false },
+                )
+
                 Text("Frequency: ${if (it.freqs.isEmpty()) "—" else it.freqs.joinToString()}")
                 Text("Power(ANT1): ${it.powerAnt1}")
               }
@@ -231,7 +299,7 @@ class Main : ComponentActivity() {
         setServiceCallback(object : BleServiceCallback() {
           override fun onServicesDiscovered(pp: BluetoothPeripheral) {
             val service = pp.services?.firstOrNull { it.uuid == want }
-            ?: run { err = "svc $want"; close(); return }
+              ?: run { err = "svc $want"; close(); return }
             findCharacteristic(service)
             p = pp
             setMtu(255)
@@ -254,7 +322,7 @@ class Main : ComponentActivity() {
   private fun connect() {
     busy = true
     c = BluetoothCentralManager(this, cb, Handler(Looper.getMainLooper()))
-    .also { it.scanForPeripherals() }
+      .also { it.scanForPeripherals() }
   }
 
   private fun close() {
